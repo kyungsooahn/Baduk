@@ -81,9 +81,9 @@
       </div>
       <div class="form-group">
         <label><b>AI 난이도:</b></label><br/>
-        <input type="radio" name="lvl" value="0"> 입문
-        <input type="radio" name="lvl" value="5" checked> 초보
-        <input type="radio" name="lvl" value="10"> 아마
+        <input type="radio" name="lvl" value="0"> 1단계(입문)
+        <input type="radio" name="lvl" value="5" checked> 2단계(초보)
+        <input type="radio" name="lvl" value="10"> 3단계(아마)
       </div>
       <div class="form-group">
         <label><b>판 크기:</b></label><br/>
@@ -101,7 +101,7 @@
 
     let sessionId = null, boardSize = 9, gameMode = "vs_ai";
     let myColor = 1, aiColor = 2, currentTurn = 1;
-    let board = [], historyBoards = [], isPaused = false, isAiThinking = false;
+    let board = [], isPaused = false, isAiThinking = false, aiTimerId = null;
     let bTime = 600, wTime = 600, bWin = 50.0, wWin = 50.0;
     let hintPos = null, showTerritory = false, evalData = null;
 
@@ -152,6 +152,7 @@
       ctx.clearRect(0, 0, 800, 800);
       const margin = 60, span = (800 - margin * 2) / (boardSize - 1);
 
+      // 좌표
       ctx.fillStyle = "#4E342E"; ctx.font = "bold 20px Arial"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
       for (let i = 0; i < boardSize; i++) {
         const x = margin + i * span, y = margin + i * span;
@@ -161,6 +162,7 @@
         ctx.fillText(String(boardSize - i), 800 - margin + 35, y);
       }
 
+      // 격자선
       ctx.strokeStyle = "#000"; ctx.lineWidth = 2;
       for (let i = 0; i < boardSize; i++) {
         ctx.beginPath();
@@ -169,6 +171,7 @@
         ctx.stroke();
       }
 
+      // 화점
       const stars = boardSize === 9 ? [[2,2],[2,6],[6,2],[6,6],[4,4]] : [[3,3],[3,9],[3,15],[9,3],[9,9],[9,15],[15,3],[15,9],[15,15]];
       ctx.fillStyle = "#000";
       stars.forEach(([r, c]) => {
@@ -177,22 +180,28 @@
         ctx.fill();
       });
 
+      // 집 표시 (형세 오버레이)
       if (showTerritory && evalData) {
-        evalData.black_territory.forEach(([r, c]) => {
-          if (board[r][c] === 0) {
-            ctx.fillStyle = "rgba(0,0,0,0.8)";
-            ctx.fillRect(margin + c * span - 10, margin + r * span - 10, 20, 20);
-          }
-        });
-        evalData.white_territory.forEach(([r, c]) => {
-          if (board[r][c] === 0) {
-            ctx.fillStyle = "rgba(255,255,255,0.9)";
-            ctx.fillRect(margin + c * span - 10, margin + r * span - 10, 20, 20);
-            ctx.strokeStyle = "#000"; ctx.strokeRect(margin + c * span - 10, margin + r * span - 10, 20, 20);
-          }
-        });
+        if (evalData.black_territory) {
+          evalData.black_territory.forEach(([r, c]) => {
+            if (board[r][c] === 0) {
+              ctx.fillStyle = "rgba(0,0,0,0.85)";
+              ctx.fillRect(margin + c * span - 10, margin + r * span - 10, 20, 20);
+            }
+          });
+        }
+        if (evalData.white_territory) {
+          evalData.white_territory.forEach(([r, c]) => {
+            if (board[r][c] === 0) {
+              ctx.fillStyle = "rgba(255,255,255,0.95)";
+              ctx.fillRect(margin + c * span - 10, margin + r * span - 10, 20, 20);
+              ctx.strokeStyle = "#000"; ctx.strokeRect(margin + c * span - 10, margin + r * span - 10, 20, 20);
+            }
+          });
+        }
       }
 
+      // 돌 렌더링
       for (let r = 0; r < boardSize; r++) {
         for (let c = 0; c < boardSize; c++) {
           if (board[r][c] !== 0) {
@@ -205,7 +214,8 @@
         }
       }
 
-      if (showTerritory && evalData) {
+      // 사석 (죽은 돌 X 표시)
+      if (showTerritory && evalData && evalData.dead_stones) {
         evalData.dead_stones.forEach(([r, c]) => {
           if (board[r][c] !== 0) {
             const cx = margin + c * span, cy = margin + r * span;
@@ -218,6 +228,7 @@
         });
       }
 
+      // 힌트 위치 주황색 점
       if (hintPos) {
         ctx.fillStyle = "#ff5722";
         ctx.beginPath();
@@ -226,7 +237,6 @@
       }
     }
 
-    // [핵심] 클릭 시 0ms 즉시 화면 렌더링 (낙관적 UI 적용)
     canvas.addEventListener("click", async (e) => {
       if (isPaused || isAiThinking) return;
       if (gameMode === "vs_ai" && currentTurn !== myColor) return;
@@ -243,47 +253,31 @@
       if (r < 0 || r >= boardSize || c < 0 || c >= boardSize) return;
       if (board[r][c] !== 0) return;
 
-      // 1. 클릭 즉시 브라우저 화면에 돌을 먼저 그림 (0ms 체감)
-      historyBoards.push(JSON.parse(JSON.stringify(board)));
-      board[r][c] = currentTurn;
-      const placedTurn = currentTurn;
-      hintPos = null;
-      draw();
-
-      // 턴 즉시 넘김
-      currentTurn = currentTurn === 1 ? 2 : 1;
-      updateUI();
-
-      // 2. 비동기로 서버에 전달하여 사활/규칙 검증
-      const colStr = placedTurn === 1 ? "black" : "white";
+      const colStr = currentTurn === 1 ? "black" : "white";
       const res = await fetch("/api/play", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ session_id: sessionId, color: colStr, r, c })
       });
       const data = await res.json();
+      if (!data.success) { alert(data.msg); return; }
 
-      // 규칙 위반(자충/패 등) 시 롤백
-      if (!data.success) {
-        board = historyBoards.pop();
-        currentTurn = placedTurn;
-        draw();
-        updateUI();
-        alert(data.msg);
-        return;
-      }
-
-      // 승률 갱신
+      board = data.board;
       bWin = data.black_winrate;
       wWin = data.white_winrate;
-      updateUI();
+      hintPos = null;
+      showTerritory = false; // 새 착수 시 형세 오버레이 끔
+      draw();
 
+      currentTurn = currentTurn === 1 ? 2 : 1;
+      updateUI();
       if (gameMode === "vs_ai" && currentTurn === aiColor) scheduleAi();
     });
 
     function scheduleAi() {
       isAiThinking = true;
-      setTimeout(async () => {
+      if (aiTimerId) clearTimeout(aiTimerId);
+      aiTimerId = setTimeout(async () => {
         if (isPaused) return;
         const colStr = aiColor === 1 ? "black" : "white";
         const res = await fetch(`/api/genmove?color=${colStr}`, {
@@ -293,16 +287,16 @@
         });
         const data = await res.json();
         
-        if (data.pos) {
-          historyBoards.push(JSON.parse(JSON.stringify(board)));
-          board[data.pos[0]][data.pos[1]] = aiColor;
-          draw();
-        } else {
+        board = data.board;
+        bWin = data.black_winrate;
+        wWin = data.white_winrate;
+        hintPos = null;
+        draw();
+
+        if (!data.pos) {
           alert(`AI가 ${data.gtp}을(를) 선언했습니다.`);
         }
 
-        bWin = data.black_winrate;
-        wWin = data.white_winrate;
         currentTurn = myColor;
         isAiThinking = false;
         updateUI();
@@ -310,34 +304,61 @@
     }
 
     async function handleUndo() {
+      if (aiTimerId) { clearTimeout(aiTimerId); aiTimerId = null; isAiThinking = false; }
+
       const steps = gameMode === "2player" ? 1 : 2;
-      await fetch(`/api/undo?steps=${steps}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session_id: sessionId })
-      });
-      for (let i = 0; i < steps; i++) {
-        if (historyBoards.length > 0) board = historyBoards.pop();
-      }
-      if (gameMode === "2player") currentTurn = currentTurn === 1 ? 2 : 1;
-      else currentTurn = myColor;
-      hintPos = null;
-      draw();
-      updateUI();
-    }
-
-    function handlePause() { isPaused = true; updateUI(); }
-    function handleResume() { isPaused = false; updateUI(); if (gameMode === "vs_ai" && currentTurn === aiColor) scheduleAi(); }
-
-    async function handleHint() {
-      const colStr = currentTurn === 1 ? "black" : "white";
-      const res = await fetch(`/api/hint?color=${colStr}`, {
+      const res = await fetch(`/api/undo?steps=${steps}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ session_id: sessionId })
       });
       const data = await res.json();
-      if (data.pos) { hintPos = data.pos; draw(); }
+      
+      board = data.board;
+      bWin = data.black_winrate;
+      wWin = data.white_winrate;
+      if (gameMode === "2player") currentTurn = currentTurn === 1 ? 2 : 1;
+      else currentTurn = myColor;
+
+      hintPos = null;
+      showTerritory = false;
+      draw();
+      updateUI();
+    }
+
+    function handlePause() { 
+      isPaused = true; 
+      if (aiTimerId) { clearTimeout(aiTimerId); aiTimerId = null; }
+      updateUI(); 
+    }
+
+    function handleResume() { 
+      isPaused = false; 
+      updateUI(); 
+      if (gameMode === "vs_ai" && currentTurn === aiColor) scheduleAi(); 
+    }
+
+    async function handleHint() {
+      // 내가 둘 차례면 '추천 수', AI 대기 중이면 '방금 둔 수 복기'
+      const isReview = (gameMode === "vs_ai" && currentTurn === aiColor);
+      const targetCol = isReview ? (myColor === 1 ? "black" : "white") : (currentTurn === 1 ? "black" : "white");
+
+      const res = await fetch("/api/hint", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId, target_color: targetCol, is_review: isReview })
+      });
+      const data = await res.json();
+      
+      if (data.pos) {
+        hintPos = data.pos;
+        draw();
+        if (data.is_review) {
+          alert(`[복기 힌트]\n방금 두신 수: ${data.played_gtp}\n엔진 추천 최선수: ${data.gtp}`);
+        } else {
+          alert(`[착수 힌트]\n추천 위치: ${data.gtp}`);
+        }
+      }
     }
 
     async function handleEval() {
@@ -352,8 +373,12 @@
         bWin = evalData.black_winrate;
         wWin = evalData.white_winrate;
         updateUI();
+        draw();
+
+        alert(`[형세 분석]\n${evalData.score_desc}\n• 흑 집: ${evalData.black_territory.length}곳 (검은 사각형)\n• 백 집: ${evalData.white_territory.length}곳 (흰색 사각형)\n• 잡힌 돌: ${evalData.dead_stones.length}개 (빨간 X)`);
+      } else {
+        draw();
       }
-      draw();
     }
   </script>
 </body>
