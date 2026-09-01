@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+  <title>바둑 트레이너</title>
+  <style>
+    * { box-sizing: border-box; touch-action: manipulation; }
+    body {
+      margin: 0; padding: 0;
+      background-color: #f0f2f5;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      display: flex; flex-direction: column; align-items: center;
+    }
+    #top-bar {
+      width: 100%; max-width: 440px; background: #263238; color: white;
+      padding: 10px 15px; display: flex; justify-content: space-between;
+      font-size: 13px; font-weight: bold;
+    }
+    #turn-indicator { color: #ffeb3b; font-size: 14px; }
+    #board-container {
+      margin-top: 10px; width: 95vw; max-width: 440px;
+      aspect-ratio: 1/1; position: relative;
+    }
+    canvas {
+      width: 100%; height: 100%;
+      background-color: #dcb35c;
+      border-radius: 4px; box-shadow: 0 4px 10px rgba(0,0,0,0.25);
+    }
+    #btn-grid {
+      width: 95vw; max-width: 440px; margin-top: 15px;
+      display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px;
+    }
+    button {
+      padding: 12px 0; border: none; border-radius: 6px;
+      background: #37474f; color: white; font-weight: bold; font-size: 13px;
+    }
+    button:active { background: #546e7a; }
+    #modal {
+      position: fixed; inset: 0; background: rgba(0,0,0,0.6);
+      display: flex; justify-content: center; align-items: center; z-index: 100;
+    }
+    .modal-box {
+      background: white; border-radius: 12px; padding: 20px; width: 85vw; max-width: 340px;
+    }
+    .form-group { margin-bottom: 12px; font-size: 14px; }
+  </style>
+</head>
+<body>
+
+  <div id="top-bar">
+    <div id="black-info">흑: 10:00 (50%)</div>
+    <div id="turn-indicator">흑돌 차례</div>
+    <div id="white-info">백: 10:00 (50%)</div>
+  </div>
+
+  <div id="board-container">
+    <canvas id="goCanvas" width="800" height="800"></canvas>
+  </div>
+
+  <div id="btn-grid">
+    <button onclick="handleUndo()">뒤로</button>
+    <button onclick="handlePause()">정지</button>
+    <button onclick="handleResume()">재개</button>
+    <button onclick="handleHint()">힌트</button>
+    <button onclick="handleEval()">형세</button>
+  </div>
+
+  <div id="modal">
+    <div class="modal-box">
+      <h3 style="margin-top:0;">게임 설정</h3>
+      <div class="form-group">
+        <label><b>모드:</b></label><br/>
+        <input type="radio" name="mode" value="vs_ai" checked> AI 대국
+        <input type="radio" name="mode" value="2player"> 2인 플레이
+      </div>
+      <div class="form-group">
+        <label><b>내 돌:</b></label><br/>
+        <input type="radio" name="col" value="1" checked> 흑돌
+        <input type="radio" name="col" value="2"> 백돌
+      </div>
+      <div class="form-group">
+        <label><b>AI 난이도:</b></label><br/>
+        <input type="radio" name="lvl" value="0"> 입문
+        <input type="radio" name="lvl" value="5" checked> 초보
+        <input type="radio" name="lvl" value="10"> 아마
+      </div>
+      <div class="form-group">
+        <label><b>판 크기:</b></label><br/>
+        <input type="radio" name="size" value="9" checked> 9x9
+        <input type="radio" name="size" value="19"> 19x19
+      </div>
+      <button style="width:100%; background:#2e7d32;" onclick="initGame()">시작하기</button>
+    </div>
+  </div>
+
+  <script>
+    const canvas = document.getElementById("goCanvas");
+    const ctx = canvas.getContext("2d");
+    const letters = "ABCDEFGHJKLMNOPQRST";
+
+    let sessionId = null, boardSize = 9, gameMode = "vs_ai";
+    let myColor = 1, aiColor = 2, currentTurn = 1;
+    let board = [], isPaused = false, isAiThinking = false;
+    let bTime = 600, wTime = 600, bWin = 50.0, wWin = 50.0;
+    let hintPos = null, showTerritory = false, evalData = null;
+
+    async function initGame() {
+      gameMode = document.querySelector('input[name="mode"]:checked').value;
+      myColor = parseInt(document.querySelector('input[name="col"]:checked').value);
+      aiColor = myColor === 1 ? 2 : 1;
+      const lvl = parseInt(document.querySelector('input[name="lvl"]:checked').value);
+      boardSize = parseInt(document.querySelector('input[name="size"]:checked').value);
+
+      const res = await fetch("/api/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ size: boardSize, level: lvl })
+      });
+      const data = await res.json();
+      sessionId = data.session_id;
+
+      board = Array(boardSize).fill().map(() => Array(boardSize).fill(0));
+      document.getElementById("modal").style.display = "none";
+
+      setInterval(runClock, 1000);
+      draw();
+
+      if (gameMode === "vs_ai" && myColor === 2) {
+        scheduleAi();
+      }
+    }
+
+    function runClock() {
+      if (isPaused) return;
+      if (currentTurn === 1 && bTime > 0) bTime--;
+      if (currentTurn === 2 && wTime > 0) wTime--;
+      updateUI();
+    }
+
+    function updateUI() {
+      const bM = String(Math.floor(bTime / 60)).padStart(2, '0');
+      const bS = String(bTime % 60).padStart(2, '0');
+      const wM = String(Math.floor(wTime / 60)).padStart(2, '0');
+      const wS = String(wTime % 60).padStart(2, '0');
+      document.getElementById("black-info").innerText = `흑: ${bM}:${bS} (${bWin}%)`;
+      document.getElementById("white-info").innerText = `백: ${wM}:${wS} (${wWin}%)`;
+      document.getElementById("turn-indicator").innerText = isPaused ? "일시정지" : (currentTurn === 1 ? "흑돌 차례" : "백돌 차례");
+    }
+
+    function draw() {
+      ctx.clearRect(0, 0, 800, 800);
+      const margin = 60, span = (800 - margin * 2) / (boardSize - 1);
+
+      ctx.fillStyle = "#4E342E"; ctx.font = "bold 20px Arial"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      for (let i = 0; i < boardSize; i++) {
+        const x = margin + i * span, y = margin + i * span;
+        ctx.fillText(letters[i], x, margin - 30);
+        ctx.fillText(letters[i], x, 800 - margin + 30);
+        ctx.fillText(String(boardSize - i), margin - 35, y);
+        ctx.fillText(String(boardSize - i), 800 - margin + 35, y);
+      }
+
+      ctx.strokeStyle = "#000"; ctx.lineWidth = 2;
+      for (let i = 0; i < boardSize; i++) {
+        ctx.beginPath();
+        ctx.moveTo(margin, margin + i * span); ctx.lineTo(800 - margin, margin + i * span);
+        ctx.moveTo(margin + i * span, margin); ctx.lineTo(margin + i * span, 800 - margin);
+        ctx.stroke();
+      }
+
+      const stars = boardSize === 9 ? [[2,2],[2,6],[6,2],[6,6],[4,4]] : [[3,3],[3,9],[3,15],[9,3],[9,9],[9,15],[15,3],[15,9],[15,15]];
+      ctx.fillStyle = "#000";
+      stars.forEach(([r, c]) => {
+        ctx.beginPath();
+        ctx.arc(margin + c * span, margin + r * span, 5, 0, Math.PI * 2);
+        ctx.fill();
+      });
+
+      if (showTerritory && evalData) {
+        evalData.black_territory.forEach(([r, c]) => {
+          if (board[r][c] === 0) {
+            ctx.fillStyle = "rgba(0,0,0,0.8)";
+            ctx.fillRect(margin + c * span - 10, margin + r * span - 10, 20, 20);
+          }
+        });
+        evalData.white_territory.forEach(([r, c]) => {
+          if (board[r][c] === 0) {
+            ctx.fillStyle = "rgba(255,255,255,0.9)";
+            ctx.fillRect(margin + c * span - 10, margin + r * span - 10, 20, 20);
+            ctx.strokeStyle = "#000"; ctx.strokeRect(margin + c * span - 10, margin + r * span - 10, 20, 20);
+          }
+        });
+      }
+
+      for (let r = 0; r < boardSize; r++) {
+        for (let c = 0; c < boardSize; c++) {
+          if (board[r][c] !== 0) {
+            ctx.beginPath();
+            ctx.arc(margin + c * span, margin + r * span, span * 0.45, 0, Math.PI * 2);
+            ctx.fillStyle = board[r][c] === 1 ? "#111" : "#f5f5f5";
+            ctx.fill();
+            if (board[r][c] === 2) { ctx.strokeStyle = "#333"; ctx.lineWidth = 1; ctx.stroke(); }
+          }
+        }
+      }
+
+      if (showTerritory && evalData) {
+        evalData.dead_stones.forEach(([r, c]) => {
+          if (board[r][c] !== 0) {
+            const cx = margin + c * span, cy = margin + r * span;
+            ctx.strokeStyle = "#d32f2f"; ctx.lineWidth = 4;
+            ctx.beginPath();
+            ctx.moveTo(cx - 12, cy - 12); ctx.lineTo(cx + 12, cy + 12);
+            ctx.moveTo(cx - 12, cy + 12); ctx.lineTo(cx + 12, cy - 12);
+            ctx.stroke();
+          }
+        });
+      }
+
+      if (hintPos) {
+        ctx.fillStyle = "#ff5722";
+        ctx.beginPath();
+        ctx.arc(margin + hintPos[1] * span, margin + hintPos[0] * span, 10, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+
+    canvas.addEventListener("click", async (e) => {
+      if (isPaused || isAiThinking) return;
+      if (gameMode === "vs_ai" && currentTurn !== myColor) return;
+
+      const rect = canvas.getBoundingClientRect();
+      const scale = 800 / rect.width;
+      const x = (e.clientX - rect.left) * scale;
+      const y = (e.clientY - rect.top) * scale;
+
+      const margin = 60, span = (800 - margin * 2) / (boardSize - 1);
+      const c = Math.round((x - margin) / span);
+      const r = Math.round((y - margin) / span);
+
+      if (r < 0 || r >= boardSize || c < 0 || c >= boardSize) return;
+
+      const colStr = currentTurn === 1 ? "black" : "white";
+      const res = await fetch("/api/play", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId, color: colStr, r, c })
+      });
+      const data = await res.json();
+      if (!data.success) { alert(data.msg); return; }
+
+      hintPos = null;
+      await syncBoard();
+      fetchWinrate();
+
+      currentTurn = currentTurn === 1 ? 2 : 1;
+      updateUI();
+      if (gameMode === "vs_ai" && currentTurn === aiColor) scheduleAi();
+    });
+
+    function scheduleAi() {
+      isAiThinking = true;
+      setTimeout(async () => {
+        if (isPaused) return;
+        const colStr = aiColor === 1 ? "black" : "white";
+        await fetch(`/api/genmove?color=${colStr}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ session_id: sessionId })
+        });
+        await syncBoard();
+        fetchWinrate();
+        currentTurn = myColor;
+        isAiThinking = false;
+        updateUI();
+      }, 5000);
+    }
+
+    async function syncBoard() {
+      const res = await fetch("/api/board_state", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId })
+      });
+      const data = await res.json();
+      board = data.board;
+      draw();
+    }
+
+    async function fetchWinrate() {
+      const res = await fetch("/api/eval", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId })
+      });
+      const data = await res.json();
+      bWin = data.black_winrate;
+      wWin = data.white_winrate;
+      evalData = data;
+      updateUI();
+      if (showTerritory) draw();
+    }
+
+    async function handleUndo() {
+      const steps = gameMode === "2player" ? 1 : 2;
+      await fetch(`/api/undo?steps=${steps}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId })
+      });
+      if (gameMode === "2player") currentTurn = currentTurn === 1 ? 2 : 1;
+      await syncBoard();
+      fetchWinrate();
+    }
+
+    function handlePause() { isPaused = true; updateUI(); }
+    function handleResume() { isPaused = false; updateUI(); if (gameMode === "vs_ai" && currentTurn === aiColor) scheduleAi(); }
+
+    async function handleHint() {
+      const colStr = currentTurn === 1 ? "black" : "white";
+      const res = await fetch(`/api/hint?color=${colStr}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId })
+      });
+      const data = await res.json();
+      if (data.pos) { hintPos = data.pos; draw(); }
+    }
+
+    function handleEval() {
+      showTerritory = !showTerritory;
+      draw();
+    }
+  </script>
+</body>
+</html>
