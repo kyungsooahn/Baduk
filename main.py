@@ -17,14 +17,16 @@ def coord_to_gtp(r, c, size):
 
 def gtp_to_coord(gtp_str, size):
     gtp_str = gtp_str.strip().upper()
-    if gtp_str in ("PASS", "RESIGN", ""):
+    if gtp_str in ("PASS", "RESIGN", "") or not gtp_str:
         return None
     try:
         col = GTP_LETTERS.index(gtp_str[0])
         row = size - int(gtp_str[1:])
-        return row, col
+        if 0 <= row < size and 0 <= col < size:
+            return row, col
     except Exception:
-        return None
+        pass
+    return None
 
 
 class GnuGoSession:
@@ -32,6 +34,7 @@ class GnuGoSession:
         self.size = size
         self.level = level
         self.lock = threading.Lock()
+        self.history = []  # [("black", r, c), ...]
         self.process = subprocess.Popen(
             ["gnugo", "--mode", "gtp", "--level", str(level)],
             stdin=subprocess.PIPE,
@@ -60,6 +63,32 @@ class GnuGoSession:
             res = "".join(response).strip()
             return res[1:].strip() if res.startswith("=") else res
 
+    def get_board_grid(self):
+        """list_stones 명령어로 단 2회 통신하여 보드 2차원 배열 즉시 생성"""
+        grid = [[0 for _ in range(self.size)] for _ in range(self.size)]
+        b_stones = self.send_cmd("list_stones black").split()
+        w_stones = self.send_cmd("list_stones white").split()
+
+        for s in b_stones:
+            pt = gtp_to_coord(s, self.size)
+            if pt: grid[pt[0]][pt[1]] = 1
+
+        for s in w_stones:
+            pt = gtp_to_coord(s, self.size)
+            if pt: grid[pt[0]][pt[1]] = 2
+
+        return grid
+
+    def get_quick_winrate(self):
+        score_res = self.send_cmd("estimate_score")
+        lead = 0.0
+        match = re.search(r"[-+]?\d*\.\d+|\d+", score_res)
+        if match:
+            val = float(match.group())
+            lead = val if ("Black" in score_res or "B+" in score_res) else -val
+        b_win = round(max(1.0, min(99.0, 1.0 / (1.0 + math.exp(-0.18 * lead)) * 100.0)), 1)
+        return b_win, round(100.0 - b_win, 1), score_res
+
     def close(self):
         try:
             self.send_cmd("quit")
@@ -83,6 +112,11 @@ class PlayReq(BaseModel):
 class SessionReq(BaseModel):
     session_id: str
 
+class HintReq(BaseModel):
+    session_id: str
+    target_color: str
+    is_review: bool = False
+
 @app.post("/api/start")
 def api_start(req: StartReq):
     session_id = str(uuid.uuid4())
@@ -94,58 +128,89 @@ def api_play(req: PlayReq):
     sess = sessions.get(req.session_id)
     if not sess:
         raise HTTPException(status_code=404, detail="Session not found")
+    
     gtp_pos = coord_to_gtp(req.r, req.c, sess.size)
     res = sess.send_cmd(f"play {req.color} {gtp_pos}")
     if res.startswith("?"):
-        return {"success": False, "msg": "착수할 수 없는 자리입니다."}
+        return {"success": False, "msg": "착수할 수 없는 자리입니다 (자충수/패/중복)."}
     
-    # 빠른 승률 계산
-    score_res = sess.send_cmd("estimate_score")
-    lead = 0.0
-    match = re.search(r"[-+]?\d*\.\d+|\d+", score_res)
-    if match:
-        val = float(match.group())
-        lead = val if ("Black" in score_res or "B+" in score_res) else -val
-    b_win = round(max(1.0, min(99.0, 1.0 / (1.0 + math.exp(-0.18 * lead)) * 100.0)), 1)
+    sess.history.append((req.color, req.r, req.c))
+    b_win, w_win, _ = sess.get_quick_winrate()
+    board = sess.get_board_grid()
     
-    return {"success": True, "black_winrate": b_win, "white_winrate": round(100.0 - b_win, 1)}
+    return {
+        "success": True,
+        "board": board,
+        "black_winrate": b_win,
+        "white_winrate": w_win
+    }
 
 @app.post("/api/genmove")
 def api_genmove(req: SessionReq, color: str = "white"):
     sess = sessions.get(req.session_id)
     if not sess:
         raise HTTPException(status_code=404, detail="Session not found")
+    
     res = sess.send_cmd(f"genmove {color}")
     pos = gtp_to_coord(res, sess.size)
+    if pos:
+        sess.history.append((color, pos[0], pos[1]))
     
-    # 빠른 승률 계산
-    score_res = sess.send_cmd("estimate_score")
-    lead = 0.0
-    match = re.search(r"[-+]?\d*\.\d+|\d+", score_res)
-    if match:
-        val = float(match.group())
-        lead = val if ("Black" in score_res or "B+" in score_res) else -val
-    b_win = round(max(1.0, min(99.0, 1.0 / (1.0 + math.exp(-0.18 * lead)) * 100.0)), 1)
+    b_win, w_win, _ = sess.get_quick_winrate()
+    board = sess.get_board_grid()
 
-    return {"gtp": res, "pos": pos, "black_winrate": b_win, "white_winrate": round(100.0 - b_win, 1)}
+    return {
+        "gtp": res,
+        "pos": pos,
+        "board": board,
+        "black_winrate": b_win,
+        "white_winrate": w_win
+    }
 
 @app.post("/api/undo")
 def api_undo(req: SessionReq, steps: int = 1):
     sess = sessions.get(req.session_id)
     if not sess:
         raise HTTPException(status_code=404, detail="Session not found")
+    
     for _ in range(steps):
-        sess.send_cmd("undo")
-    return {"success": True}
+        if sess.history:
+            sess.send_cmd("undo")
+            sess.history.pop()
+            
+    board = sess.get_board_grid()
+    b_win, w_win, _ = sess.get_quick_winrate()
+    return {"success": True, "board": board, "black_winrate": b_win, "white_winrate": w_win}
 
 @app.post("/api/hint")
-def api_hint(req: SessionReq, color: str = "black"):
+def api_hint(req: HintReq):
     sess = sessions.get(req.session_id)
     if not sess:
         raise HTTPException(status_code=404, detail="Session not found")
-    best_gtp = sess.send_cmd(f"reg_genmove {color}")
-    pos = gtp_to_coord(best_gtp, sess.size)
-    return {"gtp": best_gtp, "pos": pos}
+
+    if not req.is_review:
+        # 1) 착수 전 최선수
+        best_gtp = sess.send_cmd(f"reg_genmove {req.target_color}")
+        pos = gtp_to_coord(best_gtp, sess.size)
+        return {"gtp": best_gtp, "pos": pos, "is_review": False}
+    else:
+        # 2) 방금 둔 수 복기 힌트
+        if not sess.history:
+            return {"gtp": None, "pos": None, "is_review": True}
+        
+        last_col, last_r, last_c = sess.history[-1]
+        sess.send_cmd("undo")
+        best_gtp = sess.send_cmd(f"reg_genmove {last_col}")
+        # 복원
+        sess.send_cmd(f"play {last_col} {coord_to_gtp(last_r, last_c, sess.size)}")
+        
+        pos = gtp_to_coord(best_gtp, sess.size)
+        return {
+            "gtp": best_gtp,
+            "pos": pos,
+            "played_gtp": coord_to_gtp(last_r, last_c, sess.size),
+            "is_review": True
+        }
 
 @app.post("/api/eval")
 def api_eval(req: SessionReq):
@@ -153,25 +218,29 @@ def api_eval(req: SessionReq):
     if not sess:
         raise HTTPException(status_code=404, detail="Session not found")
     
-    score_res = sess.send_cmd("estimate_score")
-    b_terr = sess.send_cmd("final_status_list black_territory").split()
-    w_terr = sess.send_cmd("final_status_list white_territory").split()
-    dead = sess.send_cmd("final_status_list dead").split()
+    b_win, w_win, score_res = sess.get_quick_winrate()
 
-    lead = 0.0
-    match = re.search(r"[-+]?\d*\.\d+|\d+", score_res)
-    if match:
-        val = float(match.group())
-        lead = val if ("Black" in score_res or "B+" in score_res) else -val
-    b_win = round(max(1.0, min(99.0, 1.0 / (1.0 + math.exp(-0.18 * lead)) * 100.0)), 1)
+    # 사활 및 집 리스트 안전 파싱
+    def parse_points(cmd_str):
+        raw = sess.send_cmd(cmd_str)
+        if raw.startswith("?"): return []
+        pts = []
+        for p in raw.split():
+            c = gtp_to_coord(p, sess.size)
+            if c: pts.append(c)
+        return pts
+
+    b_terr = parse_points("final_status_list black_territory")
+    w_terr = parse_points("final_status_list white_territory")
+    dead = parse_points("final_status_list dead")
 
     return {
         "black_winrate": b_win,
-        "white_winrate": round(100.0 - b_win, 1),
+        "white_winrate": w_win,
         "score_desc": score_res,
-        "black_territory": [gtp_to_coord(p, sess.size) for p in b_terr if gtp_to_coord(p, sess.size)],
-        "white_territory": [gtp_to_coord(p, sess.size) for p in w_terr if gtp_to_coord(p, sess.size)],
-        "dead_stones": [gtp_to_coord(p, sess.size) for p in dead if gtp_to_coord(p, sess.size)]
+        "black_territory": b_terr,
+        "white_territory": w_terr,
+        "dead_stones": dead
     }
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
