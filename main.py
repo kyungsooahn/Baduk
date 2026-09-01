@@ -3,6 +3,7 @@ import threading
 import math
 import re
 import uuid
+import os
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -32,8 +33,11 @@ class GnuGoSession:
         self.size = size
         self.level = level
         self.lock = threading.Lock()
+        
+        # 윈도우 환경(gnugo.exe) 및 리눅스 환경(gnugo) 호환
+        exec_cmd = "gnugo.exe" if os.name == "nt" else "gnugo"
         self.process = subprocess.Popen(
-            ["gnugo", "--mode", "gtp", "--level", str(level)],
+            [exec_cmd, "--mode", "gtp", "--level", str(level)],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -48,17 +52,20 @@ class GnuGoSession:
         with self.lock:
             if not self.process:
                 return ""
-            self.process.stdin.write(cmd.strip() + "\n")
-            self.process.stdin.flush()
-            response = []
-            while True:
-                line = self.process.stdout.readline()
-                if line.strip() == "" and response:
-                    break
-                if line:
-                    response.append(line)
-            res = "".join(response).strip()
-            return res[1:].strip() if res.startswith("=") else res
+            try:
+                self.process.stdin.write(cmd.strip() + "\n")
+                self.process.stdin.flush()
+                response = []
+                while True:
+                    line = self.process.stdout.readline()
+                    if line.strip() == "" and response:
+                        break
+                    if line:
+                        response.append(line)
+                res = "".join(response).strip()
+                return res[1:].strip() if res.startswith("=") else res
+            except Exception as e:
+                return ""
 
     def close(self):
         try:
@@ -70,9 +77,10 @@ class GnuGoSession:
 
 sessions = {}
 
+# Pydantic 통신 데이터 모델
 class StartReq(BaseModel):
-    size: int
-    level: int
+    size: int = 9
+    level: int = 5
 
 class PlayReq(BaseModel):
     session_id: str
@@ -80,58 +88,74 @@ class PlayReq(BaseModel):
     r: int
     c: int
 
+class GenmoveReq(BaseModel):
+    session_id: str
+    color: str = "white"
+
+class HintReq(BaseModel):
+    session_id: str
+    color: str = "black"
+
+class UndoReq(BaseModel):
+    session_id: str
+    steps: int = 1
+
 class SessionReq(BaseModel):
     session_id: str
+
 
 @app.post("/api/start")
 def api_start(req: StartReq):
     session_id = str(uuid.uuid4())
-    sessions[session_id] = GnuGoSession(size=req.size, level=req.level)
-    return {"session_id": session_id}
+    try:
+        sessions[session_id] = GnuGoSession(size=req.size, level=req.level)
+        return {"success": True, "session_id": session_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"GnuGo 엔진 실행 실패: {str(e)}")
 
 @app.post("/api/play")
 def api_play(req: PlayReq):
     sess = sessions.get(req.session_id)
     if not sess:
-        raise HTTPException(status_code=404, detail="Session not found")
+        raise HTTPException(status_code=404, detail="세션을 찾을 수 없습니다.")
     gtp_pos = coord_to_gtp(req.r, req.c, sess.size)
     res = sess.send_cmd(f"play {req.color} {gtp_pos}")
     if res.startswith("?"):
-        return {"success": False, "msg": "착수할 수 없는 자리입니다."}
+        return {"success": False, "msg": "착수할 수 없는 곳입니다 (자충수/패/중복)."}
     return {"success": True}
 
 @app.post("/api/genmove")
-def api_genmove(req: SessionReq, color: str = "white"):
+def api_genmove(req: GenmoveReq):
     sess = sessions.get(req.session_id)
     if not sess:
-        raise HTTPException(status_code=404, detail="Session not found")
-    res = sess.send_cmd(f"genmove {color}")
+        raise HTTPException(status_code=404, detail="세션을 찾을 수 없습니다.")
+    res = sess.send_cmd(f"genmove {req.color}")
     pos = gtp_to_coord(res, sess.size)
-    return {"gtp": res, "pos": pos}
+    return {"success": True, "gtp": res, "pos": pos}
 
 @app.post("/api/undo")
-def api_undo(req: SessionReq, steps: int = 1):
+def api_undo(req: UndoReq):
     sess = sessions.get(req.session_id)
     if not sess:
-        raise HTTPException(status_code=404, detail="Session not found")
-    for _ in range(steps):
+        raise HTTPException(status_code=404, detail="세션을 찾을 수 없습니다.")
+    for _ in range(req.steps):
         sess.send_cmd("undo")
     return {"success": True}
 
 @app.post("/api/hint")
-def api_hint(req: SessionReq, color: str = "black"):
+def api_hint(req: HintReq):
     sess = sessions.get(req.session_id)
     if not sess:
-        raise HTTPException(status_code=404, detail="Session not found")
-    best_gtp = sess.send_cmd(f"reg_genmove {color}")
+        raise HTTPException(status_code=404, detail="세션을 찾을 수 없습니다.")
+    best_gtp = sess.send_cmd(f"reg_genmove {req.color}")
     pos = gtp_to_coord(best_gtp, sess.size)
-    return {"gtp": best_gtp, "pos": pos}
+    return {"success": True, "gtp": best_gtp, "pos": pos}
 
 @app.post("/api/eval")
 def api_eval(req: SessionReq):
     sess = sessions.get(req.session_id)
     if not sess:
-        raise HTTPException(status_code=404, detail="Session not found")
+        raise HTTPException(status_code=404, detail="세션을 찾을 수 없습니다.")
     
     score_res = sess.send_cmd("estimate_score")
     b_terr = sess.send_cmd("final_status_list black_territory").split()
@@ -143,14 +167,17 @@ def api_eval(req: SessionReq):
     if match:
         val = float(match.group())
         lead = val if ("Black" in score_res or "B+" in score_res) else -val
+    else:
+        lead = (len(b_terr) - len(w_terr)) - 6.5
     
     b_win = 1.0 / (1.0 + math.exp(-0.18 * lead)) * 100.0
     b_win = max(1.0, min(99.0, b_win))
 
     return {
+        "success": True,
         "black_winrate": round(b_win, 1),
         "white_winrate": round(100.0 - b_win, 1),
-        "score_desc": score_res,
+        "score_desc": score_res if score_res else "판단 불가",
         "black_territory": [gtp_to_coord(p, sess.size) for p in b_terr if gtp_to_coord(p, sess.size)],
         "white_territory": [gtp_to_coord(p, sess.size) for p in w_terr if gtp_to_coord(p, sess.size)],
         "dead_stones": [gtp_to_coord(p, sess.size) for p in dead if gtp_to_coord(p, sess.size)]
@@ -160,7 +187,7 @@ def api_eval(req: SessionReq):
 def api_board_state(req: SessionReq):
     sess = sessions.get(req.session_id)
     if not sess:
-        raise HTTPException(status_code=404, detail="Session not found")
+        raise HTTPException(status_code=404, detail="세션을 찾을 수 없습니다.")
     board = []
     for r in range(sess.size):
         row = []
@@ -169,9 +196,11 @@ def api_board_state(req: SessionReq):
             col = sess.send_cmd(f"color {p}").lower()
             row.append(1 if "black" in col else (2 if "white" in col else 0))
         board.append(row)
-    return {"board": board}
+    return {"success": True, "board": board}
 
-app.mount("/static", StaticFiles(directory="static"), name="static")
+# 정적 HTML 파일 서빙
+if os.path.exists("static"):
+    app.mount("/static", StaticFiles(directory="static"), name="static")
 
 @app.get("/")
 def index():
