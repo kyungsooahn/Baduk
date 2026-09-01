@@ -3,7 +3,6 @@ import threading
 import math
 import re
 import uuid
-import os
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -33,10 +32,8 @@ class GnuGoSession:
         self.size = size
         self.level = level
         self.lock = threading.Lock()
-        
-        exec_cmd = "gnugo.exe" if os.name == "nt" else "gnugo"
         self.process = subprocess.Popen(
-            [exec_cmd, "--mode", "gtp", "--level", str(level)],
+            ["gnugo", "--mode", "gtp", "--level", str(level)],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -49,59 +46,19 @@ class GnuGoSession:
 
     def send_cmd(self, cmd):
         with self.lock:
-            if not self.process or self.process.poll() is not None:
+            if not self.process:
                 return ""
-            try:
-                self.process.stdin.write(cmd.strip() + "\n")
-                self.process.stdin.flush()
-                
-                lines = []
-                while True:
-                    line = self.process.stdout.readline()
-                    if not line:
-                        break
-                    if line.strip() == "" and lines:
-                        break
-                    if line.strip() != "":
-                        lines.append(line.strip())
-                
-                full_res = " ".join(lines)
-                if full_res.startswith("="):
-                    return full_res[1:].strip()
-                return full_res
-            except Exception:
-                return ""
-
-    def get_board_matrix(self):
-        """list_stones 명령어로 고속 보드 상태 추출"""
-        board = [[0 for _ in range(self.size)] for _ in range(self.size)]
-        
-        b_res = self.send_cmd("list_stones black").split()
-        for p in b_res:
-            coord = gtp_to_coord(p, self.size)
-            if coord:
-                board[coord[0]][coord[1]] = 1
-                
-        w_res = self.send_cmd("list_stones white").split()
-        for p in w_res:
-            coord = gtp_to_coord(p, self.size)
-            if coord:
-                board[coord[0]][coord[1]] = 2
-                
-        return board
-
-    def calculate_winrate(self):
-        """빠른 승률 계산"""
-        score_res = self.send_cmd("estimate_score")
-        lead = 0.0
-        match = re.search(r"[-+]?\d*\.\d+|\d+", score_res)
-        if match:
-            val = float(match.group())
-            lead = val if ("Black" in score_res or "B+" in score_res) else -val
-        
-        b_win = 1.0 / (1.0 + math.exp(-0.18 * lead)) * 100.0
-        b_win = max(1.0, min(99.0, b_win))
-        return round(b_win, 1), round(100.0 - b_win, 1)
+            self.process.stdin.write(cmd.strip() + "\n")
+            self.process.stdin.flush()
+            response = []
+            while True:
+                line = self.process.stdout.readline()
+                if line.strip() == "" and response:
+                    break
+                if line:
+                    response.append(line)
+            res = "".join(response).strip()
+            return res[1:].strip() if res.startswith("=") else res
 
     def close(self):
         try:
@@ -114,8 +71,8 @@ class GnuGoSession:
 sessions = {}
 
 class StartReq(BaseModel):
-    size: int = 9
-    level: int = 5
+    size: int
+    level: int
 
 class PlayReq(BaseModel):
     session_id: str
@@ -123,123 +80,101 @@ class PlayReq(BaseModel):
     r: int
     c: int
 
-class GenmoveReq(BaseModel):
-    session_id: str
-    color: str = "white"
-
-class UndoReq(BaseModel):
-    session_id: str
-    steps: int = 1
-
 class SessionReq(BaseModel):
     session_id: str
-
 
 @app.post("/api/start")
 def api_start(req: StartReq):
     session_id = str(uuid.uuid4())
-    try:
-        sess = GnuGoSession(size=req.size, level=req.level)
-        sessions[session_id] = sess
-        b_win, w_win = sess.calculate_winrate()
-        return {
-            "success": True, 
-            "session_id": session_id,
-            "board": sess.get_board_matrix(),
-            "black_winrate": b_win,
-            "white_winrate": w_win
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"엔진 시작 실패: {str(e)}")
+    sessions[session_id] = GnuGoSession(size=req.size, level=req.level)
+    return {"session_id": session_id}
 
 @app.post("/api/play")
 def api_play(req: PlayReq):
     sess = sessions.get(req.session_id)
     if not sess:
-        raise HTTPException(status_code=404, detail="세션을 찾을 수 없습니다.")
-    
+        raise HTTPException(status_code=404, detail="Session not found")
     gtp_pos = coord_to_gtp(req.r, req.c, sess.size)
     res = sess.send_cmd(f"play {req.color} {gtp_pos}")
     if res.startswith("?"):
-        return {"success": False, "msg": "착수할 수 없는 곳입니다 (자충수/패/중복)."}
+        return {"success": False, "msg": "착수할 수 없는 자리입니다."}
     
-    b_win, w_win = sess.calculate_winrate()
-    return {
-        "success": True,
-        "board": sess.get_board_matrix(),
-        "black_winrate": b_win,
-        "white_winrate": w_win
-    }
+    # 빠른 승률 계산
+    score_res = sess.send_cmd("estimate_score")
+    lead = 0.0
+    match = re.search(r"[-+]?\d*\.\d+|\d+", score_res)
+    if match:
+        val = float(match.group())
+        lead = val if ("Black" in score_res or "B+" in score_res) else -val
+    b_win = round(max(1.0, min(99.0, 1.0 / (1.0 + math.exp(-0.18 * lead)) * 100.0)), 1)
+    
+    return {"success": True, "black_winrate": b_win, "white_winrate": round(100.0 - b_win, 1)}
 
 @app.post("/api/genmove")
-def api_genmove(req: GenmoveReq):
+def api_genmove(req: SessionReq, color: str = "white"):
     sess = sessions.get(req.session_id)
     if not sess:
-        raise HTTPException(status_code=404, detail="세션을 찾을 수 없습니다.")
-    
-    res = sess.send_cmd(f"genmove {req.color}")
+        raise HTTPException(status_code=404, detail="Session not found")
+    res = sess.send_cmd(f"genmove {color}")
     pos = gtp_to_coord(res, sess.size)
-    b_win, w_win = sess.calculate_winrate()
     
-    return {
-        "success": True,
-        "gtp": res,
-        "pos": pos,
-        "board": sess.get_board_matrix(),
-        "black_winrate": b_win,
-        "white_winrate": w_win
-    }
+    # 빠른 승률 계산
+    score_res = sess.send_cmd("estimate_score")
+    lead = 0.0
+    match = re.search(r"[-+]?\d*\.\d+|\d+", score_res)
+    if match:
+        val = float(match.group())
+        lead = val if ("Black" in score_res or "B+" in score_res) else -val
+    b_win = round(max(1.0, min(99.0, 1.0 / (1.0 + math.exp(-0.18 * lead)) * 100.0)), 1)
+
+    return {"gtp": res, "pos": pos, "black_winrate": b_win, "white_winrate": round(100.0 - b_win, 1)}
 
 @app.post("/api/undo")
-def api_undo(req: UndoReq):
+def api_undo(req: SessionReq, steps: int = 1):
     sess = sessions.get(req.session_id)
     if not sess:
-        raise HTTPException(status_code=404, detail="세션을 찾을 수 없습니다.")
-    for _ in range(req.steps):
+        raise HTTPException(status_code=404, detail="Session not found")
+    for _ in range(steps):
         sess.send_cmd("undo")
-        
-    b_win, w_win = sess.calculate_winrate()
-    return {
-        "success": True,
-        "board": sess.get_board_matrix(),
-        "black_winrate": b_win,
-        "white_winrate": w_win
-    }
+    return {"success": True}
 
 @app.post("/api/hint")
-def api_hint(req: GenmoveReq):
+def api_hint(req: SessionReq, color: str = "black"):
     sess = sessions.get(req.session_id)
     if not sess:
-        raise HTTPException(status_code=404, detail="세션을 찾을 수 없습니다.")
-    best_gtp = sess.send_cmd(f"reg_genmove {req.color}")
+        raise HTTPException(status_code=404, detail="Session not found")
+    best_gtp = sess.send_cmd(f"reg_genmove {color}")
     pos = gtp_to_coord(best_gtp, sess.size)
-    return {"success": True, "gtp": best_gtp, "pos": pos}
+    return {"gtp": best_gtp, "pos": pos}
 
 @app.post("/api/eval")
 def api_eval(req: SessionReq):
     sess = sessions.get(req.session_id)
     if not sess:
-        raise HTTPException(status_code=404, detail="세션을 찾을 수 없습니다.")
+        raise HTTPException(status_code=404, detail="Session not found")
     
     score_res = sess.send_cmd("estimate_score")
     b_terr = sess.send_cmd("final_status_list black_territory").split()
     w_terr = sess.send_cmd("final_status_list white_territory").split()
     dead = sess.send_cmd("final_status_list dead").split()
 
-    b_win, w_win = sess.calculate_winrate()
+    lead = 0.0
+    match = re.search(r"[-+]?\d*\.\d+|\d+", score_res)
+    if match:
+        val = float(match.group())
+        lead = val if ("Black" in score_res or "B+" in score_res) else -val
+    b_win = round(max(1.0, min(99.0, 1.0 / (1.0 + math.exp(-0.18 * lead)) * 100.0)), 1)
 
     return {
-        "success": True,
         "black_winrate": b_win,
-        "white_winrate": w_win,
+        "white_winrate": round(100.0 - b_win, 1),
         "score_desc": score_res,
         "black_territory": [gtp_to_coord(p, sess.size) for p in b_terr if gtp_to_coord(p, sess.size)],
         "white_territory": [gtp_to_coord(p, sess.size) for p in w_terr if gtp_to_coord(p, sess.size)],
         "dead_stones": [gtp_to_coord(p, sess.size) for p in dead if gtp_to_coord(p, sess.size)]
     }
 
-if os.path.exists("static"):
-    app.mount("/static", StaticFiles(directory="static"), name="static")
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 @app.get("/")
 def index():
