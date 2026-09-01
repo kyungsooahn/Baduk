@@ -75,7 +75,7 @@
         <input type="radio" name="mode" value="2player"> 2인 플레이
       </div>
       <div class="form-group">
-        <label><b>내 돌:</b></label><br/>
+        <label><b>내 돌 (AI 대국용):</b></label><br/>
         <input type="radio" name="col" value="1" checked> 흑돌
         <input type="radio" name="col" value="2"> 백돌
       </div>
@@ -104,7 +104,7 @@
     let board = [], isPaused = false, isAiThinking = false;
     let bTime = 600, wTime = 600, bWin = 50.0, wWin = 50.0;
     let hintPos = null, showTerritory = false, evalData = null;
-    let clockInterval = null;
+    let aiTimer = null;
 
     async function initGame() {
       gameMode = document.querySelector('input[name="mode"]:checked').value;
@@ -120,21 +120,23 @@
           body: JSON.stringify({ size: boardSize, level: lvl })
         });
         const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || "엔진 실행 실패");
+        if (!data.success) throw new Error(data.detail);
+
         sessionId = data.session_id;
+        board = data.board;
+        bWin = data.black_winrate;
+        wWin = data.white_winrate;
 
-        board = Array(boardSize).fill().map(() => Array(boardSize).fill(0));
         document.getElementById("modal").style.display = "none";
-
-        if (clockInterval) clearInterval(clockInterval);
-        clockInterval = setInterval(runClock, 1000);
+        setInterval(runClock, 1000);
         draw();
+        updateUI();
 
         if (gameMode === "vs_ai" && myColor === 2) {
           scheduleAi();
         }
       } catch (err) {
-        alert(err.message);
+        alert("시작 에러: " + err.message);
       }
     }
 
@@ -158,7 +160,7 @@
       document.getElementById("white-info").innerText = `${wLabel}: ${wM}:${wS} (${wWin}%)`;
       
       let turnStr = currentTurn === 1 ? "흑돌 차례" : "백돌 차례";
-      if (isAiThinking) turnStr += " (AI 착수중...)";
+      if (isAiThinking) turnStr += " (AI 생각중...)";
       if (isPaused) turnStr += " (정지)";
       document.getElementById("turn-indicator").innerText = turnStr;
     }
@@ -167,7 +169,7 @@
       ctx.clearRect(0, 0, 800, 800);
       const margin = 60, span = (800 - margin * 2) / (boardSize - 1);
 
-      // 좌표 문자
+      // 좌표
       ctx.fillStyle = "#4E342E"; ctx.font = "bold 20px Arial"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
       for (let i = 0; i < boardSize; i++) {
         const x = margin + i * span, y = margin + i * span;
@@ -177,7 +179,7 @@
         ctx.fillText(String(boardSize - i), 800 - margin + 35, y);
       }
 
-      // 격자선
+      // 선
       ctx.strokeStyle = "#000"; ctx.lineWidth = 2;
       for (let i = 0; i < boardSize; i++) {
         ctx.beginPath();
@@ -195,7 +197,7 @@
         ctx.fill();
       });
 
-      // 형세 분석 (집 영역)
+      // 집 표시
       if (showTerritory && evalData) {
         if (evalData.black_territory) {
           evalData.black_territory.forEach(([r, c]) => {
@@ -208,7 +210,7 @@
         if (evalData.white_territory) {
           evalData.white_territory.forEach(([r, c]) => {
             if (board[r][c] === 0) {
-              ctx.fillStyle = "rgba(255,255,255,0.9)";
+              ctx.fillStyle = "rgba(255,255,255,0.95)";
               ctx.fillRect(margin + c * span - 10, margin + r * span - 10, 20, 20);
               ctx.strokeStyle = "#000"; ctx.strokeRect(margin + c * span - 10, margin + r * span - 10, 20, 20);
             }
@@ -216,7 +218,7 @@
         }
       }
 
-      // 돌 렌더링
+      // 바둑돌
       for (let r = 0; r < boardSize; r++) {
         for (let c = 0; c < boardSize; c++) {
           if (board[r][c] !== 0) {
@@ -229,7 +231,7 @@
         }
       }
 
-      // 사석 (잡힌 돌 X 표시)
+      // 사석 (X 표시)
       if (showTerritory && evalData && evalData.dead_stones) {
         evalData.dead_stones.forEach(([r, c]) => {
           if (board[r][c] !== 0) {
@@ -243,7 +245,7 @@
         });
       }
 
-      // 힌트 위치
+      // 힌트
       if (hintPos) {
         ctx.fillStyle = "#ff5722";
         ctx.beginPath();
@@ -276,19 +278,26 @@
       const data = await res.json();
       if (!data.success) { alert(data.msg); return; }
 
+      board = data.board;
+      bWin = data.black_winrate;
+      wWin = data.white_winrate;
       hintPos = null;
-      await syncBoard();
-      fetchWinrate();
+      draw();
 
       currentTurn = currentTurn === 1 ? 2 : 1;
       updateUI();
-      if (gameMode === "vs_ai" && currentTurn === aiColor) scheduleAi();
+
+      if (gameMode === "vs_ai" && currentTurn === aiColor) {
+        scheduleAi();
+      }
     });
 
     function scheduleAi() {
       isAiThinking = true;
       updateUI();
-      setTimeout(async () => {
+      if (aiTimer) clearTimeout(aiTimer);
+
+      aiTimer = setTimeout(async () => {
         if (isPaused) { isAiThinking = false; return; }
         const colStr = aiColor === 1 ? "black" : "white";
         const res = await fetch("/api/genmove", {
@@ -298,62 +307,51 @@
         });
         const data = await res.json();
         
-        await syncBoard();
-        fetchWinrate();
+        board = data.board;
+        bWin = data.black_winrate;
+        wWin = data.white_winrate;
+        hintPos = null;
+        draw();
+
         currentTurn = myColor;
         isAiThinking = false;
         updateUI();
       }, 5000);
     }
 
-    async function syncBoard() {
-      const res = await fetch("/api/board_state", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session_id: sessionId })
-      });
-      const data = await res.json();
-      if (data.success) {
-        board = data.board;
-        draw();
-      }
-    }
-
-    async function fetchWinrate() {
-      const res = await fetch("/api/eval", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session_id: sessionId })
-      });
-      const data = await res.json();
-      if (data.success) {
-        bWin = data.black_winrate;
-        wWin = data.white_winrate;
-        evalData = data;
-        updateUI();
-        if (showTerritory) draw();
-      }
-    }
-
     async function handleUndo() {
+      if (aiTimer) clearTimeout(aiTimer);
+      isAiThinking = false;
+
       const steps = gameMode === "2player" ? 1 : 2;
-      await fetch("/api/undo", {
+      const res = await fetch("/api/undo", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ session_id: sessionId, steps: steps })
       });
-      if (gameMode === "2player") currentTurn = currentTurn === 1 ? 2 : 1;
-      hintPos = null;
-      await syncBoard();
-      fetchWinrate();
-      updateUI();
+      const data = await res.json();
+      if (data.success) {
+        board = data.board;
+        bWin = data.black_winrate;
+        wWin = data.white_winrate;
+        if (gameMode === "2player") currentTurn = currentTurn === 1 ? 2 : 1;
+        else currentTurn = myColor;
+        hintPos = null;
+        draw();
+        updateUI();
+      }
     }
 
-    function handlePause() { isPaused = true; updateUI(); }
+    function handlePause() { 
+      isPaused = true; 
+      if (aiTimer) clearTimeout(aiTimer);
+      updateUI(); 
+    }
+    
     function handleResume() { 
       isPaused = false; 
       updateUI(); 
-      if (gameMode === "vs_ai" && currentTurn === aiColor && !isAiThinking) scheduleAi(); 
+      if (gameMode === "vs_ai" && currentTurn === aiColor) scheduleAi(); 
     }
 
     async function handleHint() {
@@ -367,17 +365,21 @@
       if (data.pos) {
         hintPos = data.pos;
         draw();
-        alert(`GnuGo 추천 수: ${data.gtp}`);
+        alert(`GnuGo 추천 착수 지점: ${data.gtp}`);
       }
     }
 
     async function handleEval() {
       showTerritory = !showTerritory;
       if (showTerritory) {
-        await fetchWinrate();
-        if (evalData) {
-          alert(`[형세 분석]\n${evalData.score_desc}\n흑 승률: ${evalData.black_winrate}% | 백 승률: ${evalData.white_winrate}%`);
-        }
+        const res = await fetch("/api/eval", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ session_id: sessionId })
+        });
+        evalData = await res.json();
+        draw();
+        alert(`[형세 분석]\n${evalData.score_desc}\n흑 승률: ${evalData.black_winrate}% | 백 승률: ${evalData.white_winrate}%`);
       } else {
         draw();
       }
