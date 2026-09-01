@@ -34,7 +34,6 @@ class GnuGoSession:
         self.level = level
         self.lock = threading.Lock()
         
-        # 윈도우 환경(gnugo.exe) 및 리눅스 환경(gnugo) 호환
         exec_cmd = "gnugo.exe" if os.name == "nt" else "gnugo"
         self.process = subprocess.Popen(
             [exec_cmd, "--mode", "gtp", "--level", str(level)],
@@ -50,22 +49,59 @@ class GnuGoSession:
 
     def send_cmd(self, cmd):
         with self.lock:
-            if not self.process:
+            if not self.process or self.process.poll() is not None:
                 return ""
             try:
                 self.process.stdin.write(cmd.strip() + "\n")
                 self.process.stdin.flush()
-                response = []
+                
+                lines = []
                 while True:
                     line = self.process.stdout.readline()
-                    if line.strip() == "" and response:
+                    if not line:
                         break
-                    if line:
-                        response.append(line)
-                res = "".join(response).strip()
-                return res[1:].strip() if res.startswith("=") else res
-            except Exception as e:
+                    if line.strip() == "" and lines:
+                        break
+                    if line.strip() != "":
+                        lines.append(line.strip())
+                
+                full_res = " ".join(lines)
+                if full_res.startswith("="):
+                    return full_res[1:].strip()
+                return full_res
+            except Exception:
                 return ""
+
+    def get_board_matrix(self):
+        """list_stones 명령어로 고속 보드 상태 추출"""
+        board = [[0 for _ in range(self.size)] for _ in range(self.size)]
+        
+        b_res = self.send_cmd("list_stones black").split()
+        for p in b_res:
+            coord = gtp_to_coord(p, self.size)
+            if coord:
+                board[coord[0]][coord[1]] = 1
+                
+        w_res = self.send_cmd("list_stones white").split()
+        for p in w_res:
+            coord = gtp_to_coord(p, self.size)
+            if coord:
+                board[coord[0]][coord[1]] = 2
+                
+        return board
+
+    def calculate_winrate(self):
+        """빠른 승률 계산"""
+        score_res = self.send_cmd("estimate_score")
+        lead = 0.0
+        match = re.search(r"[-+]?\d*\.\d+|\d+", score_res)
+        if match:
+            val = float(match.group())
+            lead = val if ("Black" in score_res or "B+" in score_res) else -val
+        
+        b_win = 1.0 / (1.0 + math.exp(-0.18 * lead)) * 100.0
+        b_win = max(1.0, min(99.0, b_win))
+        return round(b_win, 1), round(100.0 - b_win, 1)
 
     def close(self):
         try:
@@ -77,7 +113,6 @@ class GnuGoSession:
 
 sessions = {}
 
-# Pydantic 통신 데이터 모델
 class StartReq(BaseModel):
     size: int = 9
     level: int = 5
@@ -92,10 +127,6 @@ class GenmoveReq(BaseModel):
     session_id: str
     color: str = "white"
 
-class HintReq(BaseModel):
-    session_id: str
-    color: str = "black"
-
 class UndoReq(BaseModel):
     session_id: str
     steps: int = 1
@@ -108,30 +139,56 @@ class SessionReq(BaseModel):
 def api_start(req: StartReq):
     session_id = str(uuid.uuid4())
     try:
-        sessions[session_id] = GnuGoSession(size=req.size, level=req.level)
-        return {"success": True, "session_id": session_id}
+        sess = GnuGoSession(size=req.size, level=req.level)
+        sessions[session_id] = sess
+        b_win, w_win = sess.calculate_winrate()
+        return {
+            "success": True, 
+            "session_id": session_id,
+            "board": sess.get_board_matrix(),
+            "black_winrate": b_win,
+            "white_winrate": w_win
+        }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"GnuGo 엔진 실행 실패: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"엔진 시작 실패: {str(e)}")
 
 @app.post("/api/play")
 def api_play(req: PlayReq):
     sess = sessions.get(req.session_id)
     if not sess:
         raise HTTPException(status_code=404, detail="세션을 찾을 수 없습니다.")
+    
     gtp_pos = coord_to_gtp(req.r, req.c, sess.size)
     res = sess.send_cmd(f"play {req.color} {gtp_pos}")
     if res.startswith("?"):
         return {"success": False, "msg": "착수할 수 없는 곳입니다 (자충수/패/중복)."}
-    return {"success": True}
+    
+    b_win, w_win = sess.calculate_winrate()
+    return {
+        "success": True,
+        "board": sess.get_board_matrix(),
+        "black_winrate": b_win,
+        "white_winrate": w_win
+    }
 
 @app.post("/api/genmove")
 def api_genmove(req: GenmoveReq):
     sess = sessions.get(req.session_id)
     if not sess:
         raise HTTPException(status_code=404, detail="세션을 찾을 수 없습니다.")
+    
     res = sess.send_cmd(f"genmove {req.color}")
     pos = gtp_to_coord(res, sess.size)
-    return {"success": True, "gtp": res, "pos": pos}
+    b_win, w_win = sess.calculate_winrate()
+    
+    return {
+        "success": True,
+        "gtp": res,
+        "pos": pos,
+        "board": sess.get_board_matrix(),
+        "black_winrate": b_win,
+        "white_winrate": w_win
+    }
 
 @app.post("/api/undo")
 def api_undo(req: UndoReq):
@@ -140,10 +197,17 @@ def api_undo(req: UndoReq):
         raise HTTPException(status_code=404, detail="세션을 찾을 수 없습니다.")
     for _ in range(req.steps):
         sess.send_cmd("undo")
-    return {"success": True}
+        
+    b_win, w_win = sess.calculate_winrate()
+    return {
+        "success": True,
+        "board": sess.get_board_matrix(),
+        "black_winrate": b_win,
+        "white_winrate": w_win
+    }
 
 @app.post("/api/hint")
-def api_hint(req: HintReq):
+def api_hint(req: GenmoveReq):
     sess = sessions.get(req.session_id)
     if not sess:
         raise HTTPException(status_code=404, detail="세션을 찾을 수 없습니다.")
@@ -162,43 +226,18 @@ def api_eval(req: SessionReq):
     w_terr = sess.send_cmd("final_status_list white_territory").split()
     dead = sess.send_cmd("final_status_list dead").split()
 
-    lead = 0.0
-    match = re.search(r"[-+]?\d*\.\d+|\d+", score_res)
-    if match:
-        val = float(match.group())
-        lead = val if ("Black" in score_res or "B+" in score_res) else -val
-    else:
-        lead = (len(b_terr) - len(w_terr)) - 6.5
-    
-    b_win = 1.0 / (1.0 + math.exp(-0.18 * lead)) * 100.0
-    b_win = max(1.0, min(99.0, b_win))
+    b_win, w_win = sess.calculate_winrate()
 
     return {
         "success": True,
-        "black_winrate": round(b_win, 1),
-        "white_winrate": round(100.0 - b_win, 1),
-        "score_desc": score_res if score_res else "판단 불가",
+        "black_winrate": b_win,
+        "white_winrate": w_win,
+        "score_desc": score_res,
         "black_territory": [gtp_to_coord(p, sess.size) for p in b_terr if gtp_to_coord(p, sess.size)],
         "white_territory": [gtp_to_coord(p, sess.size) for p in w_terr if gtp_to_coord(p, sess.size)],
         "dead_stones": [gtp_to_coord(p, sess.size) for p in dead if gtp_to_coord(p, sess.size)]
     }
 
-@app.post("/api/board_state")
-def api_board_state(req: SessionReq):
-    sess = sessions.get(req.session_id)
-    if not sess:
-        raise HTTPException(status_code=404, detail="세션을 찾을 수 없습니다.")
-    board = []
-    for r in range(sess.size):
-        row = []
-        for c in range(sess.size):
-            p = coord_to_gtp(r, c, sess.size)
-            col = sess.send_cmd(f"color {p}").lower()
-            row.append(1 if "black" in col else (2 if "white" in col else 0))
-        board.append(row)
-    return {"success": True, "board": board}
-
-# 정적 HTML 파일 서빙
 if os.path.exists("static"):
     app.mount("/static", StaticFiles(directory="static"), name="static")
 
